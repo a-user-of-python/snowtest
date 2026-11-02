@@ -1,0 +1,48 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    name: Unsigned IPA
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app (unsigned)
+        run: |
+          xcodebuild -project App/SnowTest.xcodeproj \
+            -scheme SnowTest \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+      - name: Verify bundle id and device family in built app
+        run: |
+          PLIST="build/dd/Build/Products/Release-iphoneos/SnowTest.app/Info.plist"
+          python3 - "$PLIST" <<'EOF'
+          import plistlib, sys
+          with open(sys.argv[1], "rb") as f:
+              p = plistlib.load(f)
+          assert p.get("CFBundleIdentifier") == "com.user.snowtest", p.get("CFBundleIdentifier")
+          assert p.get("UIDeviceFamily") == [1, 2], p.get("UIDeviceFamily")
+          print("bundle id:", p.get("CFBundleIdentifier"))
+          print("device family:", p.get("UIDeviceFamily"))
+          EOF
+      - name: Package IPA
+        run: |
+          APP_PATH="build/dd/Build/Products/Release-iphoneos/SnowTest.app"
+          test -d "$APP_PATH"
+          rm -rf Payload SnowTest-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry SnowTest-unsigned.ipa Payload
+          ls -lh SnowTest-unsigned.ipa
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SnowTest-unsigned
+          path: SnowTest-unsigned.ipa
