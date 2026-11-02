@@ -2,10 +2,13 @@
 //
 // The simulation is 100% GPU: one MTLBuffer holds every flake, the
 // compute kernel in Shaders.metal updates it in place each frame,
-// and the render pass reads the same buffer. The CPU only fills the
-// buffer once (at start and when the flake count changes), passes
-// small uniforms, and issues one compute dispatch + one point draw
-// per frame. Particle data is never copied back.
+// and the render pass reads the same buffer. A second pair of
+// buffers holds the blanket heightfield (ping-ponged), advanced by
+// its own compute pass: growth, compaction, slope relaxation,
+// wind drift, depression refill, and the walk body's footprint
+// press. The CPU only fills buffers (at start, on count change,
+// and on Clear), passes small uniforms, and issues the passes.
+// Particle and heightfield data are never copied back.
 
 import Metal
 import MetalKit
@@ -17,7 +20,7 @@ import simd
 /// bytes). The CPU writes initial particles at these offsets; after
 /// that only the GPU touches the buffer.
 enum SnowParticleLayout {
-    static let stride = 32
+    static let stride = 36
     static let positionX = 0
     static let positionY = 4
     static let positionZ = 8
@@ -26,10 +29,11 @@ enum SnowParticleLayout {
     static let velocityZ = 20
     static let randomOffset = 24
     static let size = 28
+    static let state = 32
 }
 
 /// Mirror of `SimUniforms` in Shaders.metal — plain floats only, so
-/// the layout is identical on both sides (24 bytes).
+/// the layout is identical on both sides (44 bytes).
 struct SimUniforms {
     var dt: Float = 0
     var time: Float = 0
@@ -37,16 +41,40 @@ struct SimUniforms {
     var fallSpeed: Float = 1
     var halfExtent: Float = 14
     var height: Float = 13
+    var capHeight: Float = 0.8
+    var bodyX: Float = 0
+    var bodyZ: Float = 0
+    var bodyRadius: Float = 0.35
+    var bodyActive: Float = 0
+}
+
+/// Mirror of `HFUniforms` in Shaders.metal — plain floats only
+/// (48 bytes).
+struct HFUniforms {
+    var dt: Float = 0
+    var growthRate: Float = 0
+    var capHeight: Float = 0.8
+    var windStrength: Float = 0
+    var bodyX: Float = 0
+    var bodyZ: Float = 0
+    var bodyRadius: Float = 0.35
+    var bodyActive: Float = 0
+    var bodyMoving: Float = 0
+    var pressDepth: Float = 0.16
+    var halfExtent: Float = 14
+    var time: Float = 0
 }
 
 /// Mirror of `FrameUniforms` in Shaders.metal.
 struct FrameUniforms {
     var viewProjection = matrix_identity_float4x4
     var pointScale: Float = 1
+    var halfExtent: Float = 14
 }
 
 /// Small deterministic RNG for seeding the initial particle field
-/// (reproducible runs, no SystemRandom dependency).
+/// and the heightfield noise (reproducible runs, no
+/// SystemRandom dependency).
 struct SplitMix64 {
     var state: UInt64
     mutating func next() -> UInt64 {
@@ -97,6 +125,7 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
     @Published var flakeCount: Double = 30_000
     @Published var wind: Double = 1.5
     @Published var fallSpeed: Double = 1.0
+    @Published var walkMode: Bool = false
 
     // Live stats shown in the overlay, refreshed twice a second.
     @Published var fps: Double = 0
@@ -109,9 +138,22 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
     var cameraPitch: Float = 0.38
     var cameraDistance: Float = 16
 
+    // Walk-mode body. Positioned from the orbit camera the first
+    // time walk mode is entered, then driven by drag gestures
+    // (see applyWalkDrag). The same position is passed to the
+    // compute passes as the displacement body.
+    private var bodyX: Float = 0
+    private var bodyZ: Float = 10
+    private var bodyYaw: Float = 0.7
+    private var bodyPrevX: Float = 0
+    private var bodyPrevZ: Float = 10
+    private var wasWalkMode = false
+    private let bodyRadius: Float = 0.35
+
     let device: MTLDevice
     private let queue: MTLCommandQueue
     private let computePipeline: MTLComputePipelineState
+    private let heightfieldPipeline: MTLComputePipelineState
     private let snowPipeline: MTLRenderPipelineState
     private let groundPipeline: MTLRenderPipelineState
 
@@ -123,6 +165,22 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
     private let volumeHeight: Float = 13
     private let cameraTarget = SIMD3<Float>(0, 3.2, 0)
     private let fovY: Float = .pi / 3
+
+    // Blanket (heightfield) state. Two float buffers ping-pong:
+    // each frame the heightfield pass reads one and writes the
+    // other, then the particle pass and the vertex shader read the
+    // freshly written one. Must match GRID_N in Shaders.metal.
+    static let heightfieldGrid = 128
+    private let blanketCap: Float = 0.8
+    private let pressDepth: Float = 0.16
+    private var heightBuffers: [MTLBuffer] = []
+    private var noiseBuffer: MTLBuffer?
+    private var hfReadIndex = 0
+    // The CPU's own scalar estimate of the average blanket depth,
+    // integrated from the same growth/compaction rates the GPU
+    // uses (never read back from the GPU). It only positions the
+    // walk-mode eye height, so an approximation is fine.
+    private var avgBlanket: Float = 0
 
     private var startTime = CACurrentMediaTime()
     private var lastDrawTime: CFTimeInterval?
@@ -149,6 +207,10 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
                 fatalError("Missing compute function updateSnow")
             }
             computePipeline = try device.makeComputePipelineState(function: updateFunction)
+            guard let hfFunction = library.makeFunction(name: "updateHeightfield") else {
+                fatalError("Missing compute function updateHeightfield")
+            }
+            heightfieldPipeline = try device.makeComputePipelineState(function: hfFunction)
 
             let snowDescriptor = MTLRenderPipelineDescriptor()
             snowDescriptor.vertexFunction = library.makeFunction(name: "snowVertex")
@@ -175,10 +237,88 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
             fatalError("Metal pipeline setup failed: \(error)")
         }
         super.init()
+        buildHeightfield()
+    }
+
+    /// Create the two zeroed heightfield buffers and the static
+    /// per-cell growth-noise buffer (smooth value noise in
+    /// [0.7, 1.3], so the blanket does not rise as one flat sheet).
+    private func buildHeightfield() {
+        let n = SnowRenderer.heightfieldGrid
+        let byteCount = n * n * MemoryLayout<Float>.stride
+        heightBuffers = (0..<2).compactMap { _ in
+            device.makeBuffer(length: byteCount, options: .storageModeShared)
+        }
+        for b in heightBuffers {
+            memset(b.contents(), 0, b.length)
+        }
+        // Coarse 32x32 random grid, bilinearly upsampled to n x n.
+        let coarse = 32
+        var rng = SplitMix64(state: 0x4E4F_4953_4500_0001)
+        var grid = [Float](repeating: 0, count: coarse * coarse)
+        for i in 0..<(coarse * coarse) { grid[i] = rng.nextFloat() }
+        guard let noise = device.makeBuffer(length: byteCount, options: .storageModeShared) else {
+            noiseBuffer = nil
+            return
+        }
+        let base = noise.contents()
+        for iz in 0..<n {
+            for ix in 0..<n {
+                let fx = Float(ix) / Float(n - 1) * Float(coarse - 1)
+                let fz = Float(iz) / Float(n - 1) * Float(coarse - 1)
+                let x0 = min(Int(fx), coarse - 2)
+                let z0 = min(Int(fz), coarse - 2)
+                let tx = fx - Float(x0)
+                let tz = fz - Float(z0)
+                let v00 = grid[z0 * coarse + x0]
+                let v10 = grid[z0 * coarse + x0 + 1]
+                let v01 = grid[(z0 + 1) * coarse + x0]
+                let v11 = grid[(z0 + 1) * coarse + x0 + 1]
+                let v = (v00 * (1 - tx) + v10 * tx) * (1 - tz)
+                      + (v01 * (1 - tx) + v11 * tx) * tz
+                base.storeBytes(of: Float(0.7) + v * Float(0.6),
+                                toByteOffset: (iz * n + ix) * MemoryLayout<Float>.stride,
+                                as: Float.self)
+            }
+        }
+        noiseBuffer = noise
+    }
+
+    /// Blanket growth rate in m/s for the current flake count:
+    /// a visible coating inside a minute, a real layer over
+    /// several minutes at the 30k default.
+    private func growthRate(count: Int) -> Float {
+        0.0016 * Float(count) / 30_000
+    }
+
+    /// Restart the accumulation from bare ground: zero the blanket,
+    /// reseed the flakes, reset the CPU blanket estimate. The GPU
+    /// state is rewritten, never read.
+    func clearSnow() {
+        for b in heightBuffers {
+            memset(b.contents(), 0, b.length)
+        }
+        avgBlanket = 0
+        rebuildParticles(count: Int(flakeCount.rounded()))
+    }
+
+    /// Walk-mode drag: horizontal movement turns the body,
+    /// vertical movement walks it forward (drag up) or backward
+    /// (drag down) along its facing. Called per gesture increment.
+    func applyWalkDrag(dx: Float, dy: Float) {
+        bodyYaw -= dx * 0.005
+        let move = -dy * 0.035
+        bodyX += -sin(bodyYaw) * move
+        bodyZ += -cos(bodyYaw) * move
+        let limit = volumeHalfExtent - 0.8
+        bodyX = min(max(bodyX, -limit), limit)
+        bodyZ = min(max(bodyZ, -limit), limit)
     }
 
     /// (Re)build the particle buffer with fresh random flakes. Runs
-    /// only when the requested count changes — never per frame.
+    /// only when the requested count changes and on Clear — never
+    /// per frame. The blanket is untouched, so changing the count
+    /// mid-run does not disturb the accumulation.
     private func rebuildParticles(count: Int) {
         particleCount = count
         guard count > 0 else {
@@ -204,10 +344,13 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
             p.storeBytes(of: y, toByteOffset: SnowParticleLayout.positionY, as: Float.self)
             p.storeBytes(of: z, toByteOffset: SnowParticleLayout.positionZ, as: Float.self)
             p.storeBytes(of: Float(0), toByteOffset: SnowParticleLayout.velocityX, as: Float.self)
-            p.storeBytes(of: fall, toByteOffset: SnowParticleLayout.velocityY, as: Float.self)
+            // Velocity is the flake's actual signed velocity in
+            // v1.1: it starts out falling at its terminal speed.
+            p.storeBytes(of: -fall, toByteOffset: SnowParticleLayout.velocityY, as: Float.self)
             p.storeBytes(of: Float(0), toByteOffset: SnowParticleLayout.velocityZ, as: Float.self)
             p.storeBytes(of: rng.nextFloat() * 100, toByteOffset: SnowParticleLayout.randomOffset, as: Float.self)
             p.storeBytes(of: diameter, toByteOffset: SnowParticleLayout.size, as: Float.self)
+            p.storeBytes(of: Float(0), toByteOffset: SnowParticleLayout.state, as: Float.self)
         }
         particleBuffer = buffer
     }
@@ -231,24 +374,93 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
         }
         guard particleCount > 0,
               let buffer = particleBuffer,
+              heightBuffers.count == 2,
+              let noise = noiseBuffer,
               let passDescriptor = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable,
               let commandBuffer = queue.makeCommandBuffer() else {
             return
         }
 
-        // --- Pass 1 (compute): advance the whole simulation in
-        // place in the shared particle buffer. ---
+        // Entering walk mode: put the body where the orbit camera
+        // is, facing the way it faces, so the view doesn't jump.
+        if walkMode != wasWalkMode {
+            if walkMode {
+                let eye = cameraTarget + SIMD3<Float>(
+                    cos(cameraPitch) * sin(cameraYaw),
+                    sin(cameraPitch),
+                    cos(cameraPitch) * cos(cameraYaw)) * cameraDistance
+                let limit = volumeHalfExtent - 0.8
+                bodyX = min(max(eye.x, -limit), limit)
+                bodyZ = min(max(eye.z, -limit), limit)
+                bodyYaw = cameraYaw
+                bodyPrevX = bodyX
+                bodyPrevZ = bodyZ
+            }
+            wasWalkMode = walkMode
+        }
+
+        // Body movement this frame (for the footprint rim) and the
+        // CPU-side average-blanket estimate (walk eye height only).
+        let bodyMoved = hypot(bodyX - bodyPrevX, bodyZ - bodyPrevZ)
+        let bodyMoving: Float = (walkMode && bodyMoved > 0.003) ? 1 : 0
+        bodyPrevX = bodyX
+        bodyPrevZ = bodyZ
+        let growth = growthRate(count: particleCount)
+        let compactAvg = 0.0016 + 0.0022 * (avgBlanket / blanketCap)
+        var blanketDelta = Double(growth) - Double(avgBlanket) * Double(compactAvg)
+        if wind > 4 {
+            blanketDelta -= Double(avgBlanket) * (wind - 4) * 0.004
+        }
+        avgBlanket = Float(min(max(Double(avgBlanket) + blanketDelta * rawDt, 0),
+                               Double(blanketCap)))
+
+        let hfSrc = heightBuffers[hfReadIndex]
+        let hfDst = heightBuffers[1 - hfReadIndex]
+
+        // --- Pass 1 (compute): advance the blanket heightfield. ---
+        var hf = HFUniforms(dt: dt,
+                            growthRate: growth,
+                            capHeight: blanketCap,
+                            windStrength: Float(wind),
+                            bodyX: bodyX,
+                            bodyZ: bodyZ,
+                            bodyRadius: bodyRadius,
+                            bodyActive: walkMode ? 1 : 0,
+                            bodyMoving: bodyMoving,
+                            pressDepth: pressDepth,
+                            halfExtent: volumeHalfExtent,
+                            time: time)
+        if let hfEncoder = commandBuffer.makeComputeCommandEncoder() {
+            hfEncoder.setComputePipelineState(heightfieldPipeline)
+            hfEncoder.setBuffer(hfSrc, offset: 0, index: 0)
+            hfEncoder.setBuffer(hfDst, offset: 0, index: 1)
+            hfEncoder.setBuffer(noise, offset: 0, index: 2)
+            hfEncoder.setBytes(&hf, length: MemoryLayout<HFUniforms>.stride, index: 3)
+            let grid = SnowRenderer.heightfieldGrid
+            hfEncoder.dispatchThreads(MTLSize(width: grid, height: grid, depth: 1),
+                                      threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            hfEncoder.endEncoding()
+        }
+
+        // --- Pass 2 (compute): advance every flake in place,
+        // against the blanket the pass above just produced. ---
         var sim = SimUniforms(dt: dt,
                               time: time,
                               windStrength: Float(wind),
                               fallSpeed: Float(fallSpeed),
                               halfExtent: volumeHalfExtent,
-                              height: volumeHeight)
+                              height: volumeHeight,
+                              capHeight: blanketCap,
+                              bodyX: bodyX,
+                              bodyZ: bodyZ,
+                              bodyRadius: bodyRadius,
+                              bodyActive: walkMode ? 1 : 0)
         if let compute = commandBuffer.makeComputeCommandEncoder() {
             compute.setComputePipelineState(computePipeline)
             compute.setBuffer(buffer, offset: 0, index: 0)
             compute.setBytes(&sim, length: MemoryLayout<SimUniforms>.stride, index: 1)
+            compute.setBuffer(hfDst, offset: 0, index: 2)
             compute.dispatchThreads(MTLSize(width: particleCount, height: 1, depth: 1),
                                     threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
             compute.endEncoding()
@@ -258,19 +470,31 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
         let drawableSize = view.drawableSize
         let aspect = Float(drawableSize.width / max(drawableSize.height, 1))
         let projection = SnowMath.perspective(fovY: fovY, aspect: aspect, near: 0.1, far: 200)
-        let eye = cameraTarget + SIMD3<Float>(
-            cos(cameraPitch) * sin(cameraYaw),
-            sin(cameraPitch),
-            cos(cameraPitch) * cos(cameraYaw)) * cameraDistance
-        let viewMatrix = SnowMath.lookAt(eye: eye, target: cameraTarget, up: SIMD3<Float>(0, 1, 0))
+        let viewMatrix: simd_float4x4
+        if walkMode {
+            // Eye just above the blanket at the body's position,
+            // looking along its facing, pitched very slightly down.
+            let eye = SIMD3<Float>(bodyX, avgBlanket + 1.5, bodyZ)
+            let forward = SIMD3<Float>(-sin(bodyYaw), -0.055, -cos(bodyYaw))
+            viewMatrix = SnowMath.lookAt(eye: eye, target: eye + forward,
+                                         up: SIMD3<Float>(0, 1, 0))
+        } else {
+            let eye = cameraTarget + SIMD3<Float>(
+                cos(cameraPitch) * sin(cameraYaw),
+                sin(cameraPitch),
+                cos(cameraPitch) * cos(cameraYaw)) * cameraDistance
+            viewMatrix = SnowMath.lookAt(eye: eye, target: cameraTarget,
+                                         up: SIMD3<Float>(0, 1, 0))
+        }
         var frame = FrameUniforms()
         frame.viewProjection = projection * viewMatrix
         // Pixels per world unit at unit depth: drawableHeight/2 * proj[1][1].
         frame.pointScale = Float(drawableSize.height) * 0.5 / tan(fovY * 0.5)
+        frame.halfExtent = volumeHalfExtent
 
-        // --- Pass 2 (render): ground, then every flake in ONE
-        // point draw call reading the same buffer the compute pass
-        // just updated. ---
+        // --- Pass 3 (render): ground, then every flake in ONE
+        // point draw call reading the same buffers the compute
+        // passes just updated. ---
         if let render = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) {
             render.setRenderPipelineState(groundPipeline)
             render.setVertexBytes(&frame, length: MemoryLayout<FrameUniforms>.stride, index: 1)
@@ -279,6 +503,7 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
             render.setRenderPipelineState(snowPipeline)
             render.setVertexBuffer(buffer, offset: 0, index: 0)
             render.setVertexBytes(&frame, length: MemoryLayout<FrameUniforms>.stride, index: 1)
+            render.setVertexBuffer(hfDst, offset: 0, index: 2)
             render.drawPrimitives(type: .point, vertexStart: 0, vertexCount: particleCount)
             render.endEncoding()
         }
@@ -293,6 +518,7 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
             self.statsLock.unlock()
         }
         commandBuffer.commit()
+        hfReadIndex = 1 - hfReadIndex
 
         // --- Stats window: refresh the overlay twice a second. ---
         statFrames += 1

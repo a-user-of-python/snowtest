@@ -1,7 +1,9 @@
 // ContentView.swift — SnowTest UI: the Metal view full-screen,
-// a live stats panel top-left, and three sliders along the bottom.
-// Kept deliberately minimal: this app exists to judge the snowfall
-// and its frame rate at a glance. High contrast, uncluttered.
+// a live stats panel top-left, and the control panel along the
+// bottom (three sliders, an Orbit/Walk mode picker, and a Clear
+// snow button). Kept deliberately minimal: this app exists to
+// judge the snowfall and its frame rate at a glance. High
+// contrast, uncluttered.
 
 import SwiftUI
 import MetalKit
@@ -63,7 +65,24 @@ struct ContentView: View {
                       binding: $snow.fallSpeed,
                       range: 0.2...2.5,
                       step: 0.05)
-            Text("Drag to orbit · pinch to zoom")
+            HStack(spacing: 12) {
+                Picker("View", selection: $snow.walkMode) {
+                    Text("Orbit").tag(false)
+                    Text("Walk").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .colorScheme(.dark)
+                Button("Clear snow") { snow.clearSnow() }
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Color.white.opacity(0.18),
+                                in: RoundedRectangle(cornerRadius: 8))
+            }
+            Text(snow.walkMode
+                 ? "Walk: drag up/down to move · left/right to turn"
+                 : "Drag to orbit · pinch to zoom")
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.white.opacity(0.6))
         }
@@ -97,8 +116,12 @@ struct ContentView: View {
                 let dx = Float(value.translation.width - lastDragTranslation.width)
                 let dy = Float(value.translation.height - lastDragTranslation.height)
                 lastDragTranslation = value.translation
-                snow.cameraYaw -= dx * 0.005
-                snow.cameraPitch = min(max(snow.cameraPitch + dy * 0.005, 0.06), 1.35)
+                if snow.walkMode {
+                    snow.applyWalkDrag(dx: dx, dy: dy)
+                } else {
+                    snow.cameraYaw -= dx * 0.005
+                    snow.cameraPitch = min(max(snow.cameraPitch + dy * 0.005, 0.06), 1.35)
+                }
             }
             .onEnded { _ in lastDragTranslation = .zero }
     }
@@ -106,6 +129,9 @@ struct ContentView: View {
     private var zoomGesture: some Gesture {
         MagnifyGesture()
             .onChanged { value in
+                // Pinch zooms the orbit camera; in Walk mode the
+                // drag is the only control, so pinch is ignored.
+                guard !snow.walkMode else { return }
                 let ratio = value.magnification / lastMagnification
                 lastMagnification = value.magnification
                 let next = snow.cameraDistance / Float(ratio)

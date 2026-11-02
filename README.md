@@ -7,31 +7,54 @@ it is considered for a bigger app.
 
 ## The approach
 
-The simulation is 100% GPU, built around a single `MTLBuffer`:
+The simulation is 100% GPU, built around a single `MTLBuffer` of
+flakes plus a coarse heightfield for the blanket:
 
 - One buffer holds every flake as a `SnowParticle`
   (`packed_float3 position`, `packed_float3 velocity`,
-  `float randomOffset`, `float size` — 32 bytes per flake).
-- A Metal **compute kernel** updates the buffer **in place** every
-  frame: gravity fall at each flake's own terminal velocity,
-  sine-wave wind drift with a steady wind push, horizontal wrap,
-  and floor collision by respawn (a flake that reaches the ground
-  recycles to the top of the volume at a fresh random spot).
-- The **render pass reads the same buffer directly** — flakes are
+  `float randomOffset`, `float size`, `float state` — 36 bytes
+  per flake). `velocity` is the flake's actual signed velocity;
+  `state` is 0 while falling and counts the seconds since it
+  settled once it lands.
+- A Metal **compute kernel** updates the flake buffer **in place**
+  every frame: gravity up to each flake's terminal velocity,
+  sine-wave wind drift with a steady wind push, horizontal wrap.
+  A flake that reaches the blanket **settles and locks at its
+  landing height**, so the blanket fills with particles in layers
+  through its whole thickness. Settled flakes recycle to the sky
+  after a while (or when buried deep), so the snowfall never dies.
+- A second compute pass advances a 128×128 **heightfield** — the
+  blanket itself: it grows with the snowfall (rate follows the
+  flake count), compacts under its own weight, relaxes slopes
+  toward a ~33° angle of repose, creeps downwind and scours in
+  strong wind, refills depressions over minutes (trails heal),
+  and is pressed down where the walk-mode body stands.
+- Ground physics for settled flakes lives in the flake kernel:
+  compaction sink, surface-only wind scour (flakes buried more
+  than ~5 cm are locked), support loss (a flake whose ground is
+  carved away drops), and walk-body displacement.
+- The **render pass reads the same buffers directly** — flakes are
   drawn as point primitives (`MTLPrimitiveTypePoint`) in a single
   draw call, each point masked in the fragment shader into a soft
-  round flake. Flakes never read as squares.
-- The CPU never touches particle data after seeding it. Per frame
-  it only passes small uniforms (dt, time, wind, fall speed) and
-  issues one compute dispatch (threadgroup width 64) followed by
-  the render pass, in the same command buffer.
+  round flake. Flakes never read as squares. Settled flakes draw
+  slightly larger and brighter; buried flakes fade with depth so
+  the layers read as strata.
+- The CPU never touches particle or heightfield data after
+  seeding it. Per frame it only passes small uniforms and issues
+  two compute dispatches followed by the render pass, in the same
+  command buffer.
 
 ## On screen
 
-- A minimal scene: dark sky, one gridded ground plane at y = 0,
-  orbit camera (drag to orbit, pinch to zoom).
-- Sliders for flake count (1,000–100,000), wind strength, and fall
-  speed. Defaults: 30,000 flakes, light wind.
+- A minimal scene: dark sky, one gridded ground plane at y = 0.
+- Two cameras: **Orbit** (drag to orbit, pinch to zoom) and
+  **Walk** — a ground-level body you drag through the snow
+  (up/down to move, left/right to turn). Walking presses the
+  blanket down, pushes settled flakes aside, kicks some into the
+  air, and carves a trail that slowly heals over minutes.
+- Sliders for flake count (1,000–100,000), wind strength, and
+  fall speed. Defaults: 30,000 flakes, light wind. A **Clear
+  snow** button restarts the accumulation from bare ground.
 - A live readout of FPS, flake count, and GPU frame time, always
   visible — the numbers this app exists to produce.
 
