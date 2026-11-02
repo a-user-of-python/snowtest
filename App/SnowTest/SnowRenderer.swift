@@ -161,13 +161,20 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
 
     private var particleBuffer: MTLBuffer?
     private var particleCount = 0
-    // Count-change debounce: at v1.2 counts (up to 1M) a rebuild
-    // is a real allocation + seed, so while the Flakes slider is
-    // being dragged the rebuild waits until the requested count
-    // holds still briefly instead of thrashing one rebuild per
-    // step. The blanket is never touched either way.
+    // Count-change debounce: at v1.2/v1.3 counts (up to 5M) a
+    // rebuild is a real allocation + seed, so while the Flakes
+    // slider is being dragged the rebuild waits until the
+    // requested count holds still briefly instead of thrashing
+    // one rebuild per step. The blanket is never touched either
+    // way.
     private var pendingCount = 0
     private var pendingSince: CFTimeInterval = 0
+    // A count whose buffer allocation failed (memory pressure at
+    // the 5M ceiling): rebuildParticles keeps the old buffer in
+    // that case, and draw(in:) must not retry the same failing
+    // allocation every debounce window — only a different
+    // requested count clears the block.
+    private var failedCount = 0
 
     // Falling volume: +/- 14 m in x/z, respawn at 13 m, floor y = 0.
     private let volumeHalfExtent: Float = 14
@@ -337,24 +344,33 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
     /// only when the requested count changes (debounced, see
     /// draw(in:)) and on Clear — never per frame. The blanket is
     /// untouched, so changing the count mid-run does not disturb
-    /// the accumulation.
+    /// the accumulation. If the allocation itself fails — the
+    /// real risk at the v1.3 ceiling, where the buffer is
+    /// 36 bytes x 5M = ~180 MB — the previous buffer and count
+    /// stay live (the snow on screen is untouched) and the failed
+    /// count is remembered so the frame loop doesn't retry it.
     private func rebuildParticles(count: Int) {
-        particleCount = count
         guard count > 0 else {
+            particleCount = 0
             particleBuffer = nil
             return
         }
         let stride = SnowParticleLayout.stride
         guard let buffer = device.makeBuffer(length: stride * count,
                                              options: .storageModeShared) else {
-            particleBuffer = nil
+            failedCount = count
             return
         }
-        // Seed through a typed float pointer: at the v1.2 ceiling
-        // (1M flakes) the per-field storeBytes loop of v1.1 would
-        // stall the frame loop for seconds. Field order matches
-        // SnowParticleLayout byte offsets / 4. The buffer is not
-        // yet submitted to the GPU, so binding it here is safe.
+        // Seed through a typed float pointer: at the v1.3 ceiling
+        // (5M flakes, 45M floats) the per-field storeBytes loop of
+        // v1.1 would stall the frame loop for seconds. The typed
+        // loop is O(count) with no per-flake bridging; even so,
+        // first-touching ~180 MB of fresh buffer is the one place
+        // the app may hitch briefly when the slider first settles
+        // at the top end — a one-time cost per count change, never
+        // per frame. Field order matches SnowParticleLayout byte
+        // offsets / 4. The buffer is not yet submitted to the GPU,
+        // so binding it here is safe.
         let floatsPerFlake = stride / MemoryLayout<Float>.stride
         let floats = buffer.contents().bindMemory(to: Float.self,
                                                   capacity: count * floatsPerFlake)
@@ -378,7 +394,9 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
             floats[o + 7] = diameter
             floats[o + 8] = 0
         }
+        particleCount = count
         particleBuffer = buffer
+        failedCount = 0
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -395,7 +413,7 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
         let time = Float(now - startTime)
 
         let wanted = Int(flakeCount.rounded())
-        if wanted != particleCount {
+        if wanted != particleCount && wanted != failedCount {
             if particleCount == 0 {
                 rebuildParticles(count: wanted) // first build: no wait
                 pendingCount = particleCount
@@ -534,6 +552,11 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
         if let render = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) {
             render.setRenderPipelineState(groundPipeline)
             render.setVertexBytes(&frame, length: MemoryLayout<FrameUniforms>.stride, index: 1)
+            // The ground fragment shader samples the fresh
+            // heightfield to lay its snow-base tint (v1.3) — the
+            // same buffer the snow vertex shader reads below.
+            render.setFragmentBuffer(hfDst, offset: 0, index: 0)
+            render.setFragmentBytes(&frame, length: MemoryLayout<FrameUniforms>.stride, index: 1)
             render.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
 
             render.setRenderPipelineState(snowPipeline)

@@ -93,7 +93,7 @@ struct ContentView: View {
         .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 14))
     }
 
-    /// The Flakes slider runs on a log10 scale (1k ... 1M): fine
+    /// The Flakes slider runs on a log10 scale (1k ... 5M): fine
     /// control at the low end, coarse jumps at the high end,
     /// with the count snapped to magnitude-appropriate steps so
     /// the label stays a round number.
@@ -103,7 +103,7 @@ struct ContentView: View {
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(width: 86, alignment: .leading)
-            Slider(value: flakeCountLogBinding, in: 3.0...6.0)
+            Slider(value: flakeCountLogBinding, in: 3.0...6.69897)
                 .tint(.white)
             Text(snow.flakeCount.formatted(.number))
                 .font(.system(size: 15, weight: .medium, design: .monospaced))
@@ -117,9 +117,11 @@ struct ContentView: View {
             get: { log10(max(snow.flakeCount, 1_000)) },
             set: { newLog in
                 let raw = pow(10.0, newLog)
-                let step: Double = raw < 20_000 ? 250 : (raw < 200_000 ? 2_500 : 10_000)
+                let step: Double = raw < 20_000 ? 250
+                    : (raw < 200_000 ? 2_500
+                    : (raw < 2_000_000 ? 25_000 : 100_000))
                 let snapped = (raw / step).rounded() * step
-                snow.flakeCount = min(max(snapped, 1_000), 1_000_000)
+                snow.flakeCount = min(max(snapped, 1_000), 5_000_000)
             }
         )
     }

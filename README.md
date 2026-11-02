@@ -44,8 +44,17 @@ flakes plus a coarse heightfield for the blanket:
   drawn as point primitives (`MTLPrimitiveTypePoint`) in a single
   draw call, each point masked in the fragment shader into a soft
   round flake. Flakes never read as squares. Settled flakes draw
-  slightly larger and brighter; buried flakes fade with depth so
-  the layers read as strata.
+  at twice the falling diameter with a fuller opaque core, and
+  stay fully opaque until buried more than ~10 cm; only deeper
+  flakes fade with depth, so the layers read as strata.
+- The **ground pass samples the heightfield too**: wherever the
+  blanket has real depth it lays a packed-snow base tint under
+  the flakes, ramping in between 2 cm and 10 cm of depth. Point
+  sprites alone can't tile a surface — at grazing angles their
+  footprints shrink and the dark grid showed through the snow.
+  The tint is the field's own cover map, not a painted floor:
+  bare ground, the post-Clear floor, and thin spots still read
+  as dark gridded ground.
 - The CPU never touches particle or heightfield data after
   seeding it. Per frame it only passes small uniforms and issues
   two compute dispatches followed by the render pass, in the same
@@ -59,11 +68,15 @@ flakes plus a coarse heightfield for the blanket:
   (up/down to move, left/right to turn). Walking presses the
   blanket down, pushes settled flakes aside, kicks some into the
   air, and carves a trail that slowly heals over minutes.
-- Sliders for flake count (1,000–1,000,000 on a log scale),
+- Sliders for flake count (1,000–5,000,000 on a log scale),
   wind strength, fall speed, and flake size. Flakes are small
   by design (~1–3.6 cm) so the snow reads fine-grained.
   Defaults: 100,000 flakes, light wind. A **Clear snow**
-  button restarts the accumulation from bare ground.
+  button restarts the accumulation from bare ground. At the
+  5,000,000 ceiling the flake buffer alone is ~180 MB, and the
+  per-flake compute update plus heightfield sampling is the
+  dominant frame cost — the readout shows the true number,
+  nothing is capped or degraded to hide it.
 - A live readout of FPS, flake count, and GPU frame time, always
   visible — the numbers this app exists to produce.
 

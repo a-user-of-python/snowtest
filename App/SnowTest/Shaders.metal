@@ -2,8 +2,9 @@
 //
 // GPU snow, following the compute-particle design this test app
 // exists to prove out, extended in v1.1 with a living blanket,
-// and in v1.2 with finer snow, far more of it, and real
-// stacking:
+// in v1.2 with finer snow, far more of it, and real stacking,
+// and in v1.3 with a 5M flake ceiling and ground cover that
+// actually covers:
 //
 //   1. `updateHeightfield` (compute) advances a 256x256
 //      heightfield over the falling volume — the blanket. Per
@@ -32,12 +33,20 @@
 //   3. `snowVertex` / `snowFragment` (render) read the SAME
 //      particle buffer and draw every flake as a single point
 //      primitive, masked into a soft round flake — precipitation
-//      must never read as squares. Settled flakes draw a little
-//      larger and brighter (packed snow); flakes buried under the
-//      local surface fade out with depth, so layers read as
-//      strata instead of showing through.
+//      must never read as squares. Settled flakes draw larger
+//      (2x diameter) with a fuller opaque core so the blanket
+//      surface tiles over instead of peppering dark ground
+//      through the gaps between points; flakes within ~10 cm
+//      of the surface stay fully opaque, and only deeper
+//      buried flakes fade with depth, so the layers still read
+//      as strata instead of showing through.
 //   4. `groundVertex` / `groundFragment` draw the one ground plane
 //      procedurally (no vertex buffer) so the floor reads clearly.
+//      The fragment pass samples the same heightfield and lays a
+//      packed-snow base tint under every cell with real blanket
+//      depth — a rendering of the field, not a fake: cells with
+//      no snow (before buildup, after Clear, inside ground the
+//      blanket never reached) stay dark gridded floor.
 //
 // No particle or heightfield data ever comes back to the CPU; the
 // CPU only passes uniforms and seeds/resets buffers.
@@ -415,6 +424,7 @@ struct FlakeOut {
     float pointSize [[point_size]];
     float shade;
     float alpha;
+    float settledMix;   // 1 for settled flakes, 0 for falling
 };
 
 vertex FlakeOut snowVertex(const device SnowParticle *particles [[buffer(0)]],
@@ -428,25 +438,31 @@ vertex FlakeOut snowVertex(const device SnowParticle *particles [[buffer(0)]],
     out.position = clip;
     // Perspective point size: world diameter scaled by the frame's
     // point scale and divided by depth (clip.w = -viewZ). Settled
-    // flakes draw a little larger so the blanket surface reads as
-    // packed snow rather than sparse points. Clamped so a flake
-    // next to the camera cannot balloon and distant flakes never
-    // vanish below one pixel.
+    // flakes draw at twice the diameter so the blanket surface
+    // reads as packed snow cover rather than sparse points (1.5x
+    // in v1.2 — still sparse enough at grazing angles for the
+    // dark ground to pepper through). Clamped so a flake next to
+    // the camera cannot balloon and distant flakes never vanish
+    // below one pixel.
     float depth = max(clip.w, 0.1);
-    float sizeScale = settled ? 1.5 : 1.0;
+    float sizeScale = settled ? 2.0 : 1.0;
     out.pointSize = clamp(p.size * sizeScale * f.sizeScale * f.pointScale / depth, 1.0, 64.0);
     // Slight per-flake brightness variation so the field does not
     // read as one flat texture; settled snow a touch brighter.
     out.shade = 0.78 + 0.22 * fract(p.randomOffset * 7.31);
     if (settled) out.shade = min(out.shade + 0.10, 1.05);
-    // Burial fade: a flake below the local blanket surface fades
-    // out over ~25 cm of burial, so deep layers read as dimmer
-    // strata at grazing angles instead of showing through the
-    // surface (the renderer has no depth buffer).
+    // Burial fade: a flake well below the local blanket surface
+    // fades out over ~22 cm of burial, so deep layers read as
+    // dimmer strata at grazing angles instead of showing through
+    // the surface (the renderer has no depth buffer). The fade
+    // only starts past 10 cm of burial (3 cm in v1.2): the whole
+    // near-surface layer — the flakes doing the covering — stays
+    // fully opaque, and only genuinely deep snow dims.
     float surfY = sampleHeight(heightfield, f.halfExtent, p.position.x, p.position.z);
     float burial = surfY - p.position.y;
-    float fade = clamp(1.0 - max(burial - 0.03, 0.0) / 0.22, 0.0, 1.0);
+    float fade = clamp(1.0 - max(burial - 0.10, 0.0) / 0.22, 0.0, 1.0);
     out.alpha = (settled ? 1.0 : 0.9) * fade;
+    out.settledMix = settled ? 1.0 : 0.0;
     return out;
 }
 
@@ -454,8 +470,15 @@ fragment float4 snowFragment(FlakeOut in [[stage_in]],
                              float2 pointCoord [[point_coord]]) {
     // Mask the square point into a soft round flake: fully opaque
     // near the centre, fading smoothly to nothing at the rim.
+    // Settled flakes use a much fuller disc — opaque out to 60%
+    // of the radius instead of 20% — so neighbouring flakes on
+    // the blanket overlap into continuous cover; falling flakes
+    // keep the airier v1.2 profile so the snowfall stays light.
+    // Either way the alpha reaches zero at the rim: soft round,
+    // never square.
     float d = length(pointCoord - float2(0.5));
-    float alpha = (1.0 - smoothstep(0.1, 0.5, d)) * in.alpha;
+    float core = mix(0.10, 0.30, in.settledMix);
+    float alpha = (1.0 - smoothstep(core, 0.5, d)) * in.alpha;
     float3 colour = float3(0.93, 0.96, 1.0) * in.shade;
     return float4(colour, alpha);
 }
@@ -481,7 +504,9 @@ vertex GroundOut groundVertex(constant FrameUniforms &f [[buffer(1)]],
     return out;
 }
 
-fragment float4 groundFragment(GroundOut in [[stage_in]]) {
+fragment float4 groundFragment(GroundOut in [[stage_in]],
+                               const device float *heightfield [[buffer(0)]],
+                               constant FrameUniforms &f [[buffer(1)]]) {
     // One-metre antialiased grid over a dark blue-grey base, fading
     // to the clear colour with distance so the plane reads as a
     // floor under the snowfall rather than a hard-edged slab.
@@ -490,6 +515,30 @@ fragment float4 groundFragment(GroundOut in [[stage_in]]) {
     float2 grid = abs(fract(in.world.xz - 0.5) - 0.5) / fwidth(in.world.xz);
     float line = 1.0 - min(min(grid.x, grid.y), 1.0);
     float3 colour = base + float3(0.10, 0.12, 0.15) * line * 0.6;
+    // Snow base (v1.3): where the blanket has real depth, lay a
+    // packed-snow tint UNDER the flakes, sampled from the same
+    // heightfield the flakes settle on. Point sprites alone
+    // cannot tile a surface — at grazing angles their footprints
+    // shrink and the dark grid peppered through the blanket.
+    // This tint is what the field itself says is covered: it
+    // ramps in between 2 cm (a dusting barely whitens) and 10 cm
+    // (full cover), so bare ground, the post-Clear floor, and
+    // thin fresh trails still read as ground, while a built-up
+    // blanket reads as continuous snow even between flakes. It
+    // sits a step darker than the flakes themselves, so flake
+    // cover still reads richer than tint alone — a fresh walk
+    // trail stays visible as the smooth, flake-sparse lane it
+    // is. A faint world-space grain keeps the tint from reading
+    // as one flat painted sheet, and the cover fades out at the
+    // edge of the falling volume, beyond which no blanket exists.
+    float h = sampleHeight(heightfield, f.halfExtent, in.world.x, in.world.z);
+    float cover = smoothstep(0.02, 0.10, h);
+    float edgeFade = 1.0 - smoothstep(f.halfExtent - 0.5, f.halfExtent + 0.5,
+                                      max(abs(in.world.x), abs(in.world.z)));
+    float grain = hash1(floor(in.world.x * 24.0) * 127.1
+                      + floor(in.world.z * 24.0) * 311.7);
+    float3 snowBase = float3(0.60, 0.66, 0.76) * (0.94 + 0.08 * grain);
+    colour = mix(colour, snowBase, cover * edgeFade * 0.94);
     float fade = 1.0 - smoothstep(14.0, 36.0, length(in.world.xz));
     return float4(mix(clearColour, colour, fade), 1.0);
 }
