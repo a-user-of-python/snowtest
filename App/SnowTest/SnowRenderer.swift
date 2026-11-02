@@ -155,14 +155,15 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
             snowDescriptor.fragmentFunction = library.makeFunction(name: "snowFragment")
             snowDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
             // Soft flakes blend over the ground and each other.
-            let snowAttachment = snowDescriptor.colorAttachments[0]
-            snowAttachment.isBlendingEnabled = true
-            snowAttachment.rgbBlendOperation = .add
-            snowAttachment.alphaBlendOperation = .add
-            snowAttachment.sourceRGBBlendFactor = .sourceAlpha
-            snowAttachment.sourceAlphaBlendFactor = .one
-            snowAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
-            snowAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            if let snowAttachment = snowDescriptor.colorAttachments[0] {
+                snowAttachment.isBlendingEnabled = true
+                snowAttachment.rgbBlendOperation = .add
+                snowAttachment.alphaBlendOperation = .add
+                snowAttachment.sourceRGBBlendFactor = .sourceAlpha
+                snowAttachment.sourceAlphaBlendFactor = .one
+                snowAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+                snowAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            }
             snowPipeline = try device.makeRenderPipelineState(descriptor: snowDescriptor)
 
             let groundDescriptor = MTLRenderPipelineDescriptor()
@@ -285,7 +286,7 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
         commandBuffer.present(drawable)
         commandBuffer.addCompletedHandler { [weak self] completed in
             guard let self = self else { return }
-            let ms = (completed.GPUEndTime - completed.GPUStartTime) * 1000
+            let ms = (completed.gpuEndTime - completed.gpuStartTime) * 1000
             self.statsLock.lock()
             self.gpuTimeTotal += ms
             self.gpuTimeSamples += 1
