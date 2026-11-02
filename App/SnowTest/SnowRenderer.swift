@@ -70,6 +70,7 @@ struct FrameUniforms {
     var viewProjection = matrix_identity_float4x4
     var pointScale: Float = 1
     var halfExtent: Float = 14
+    var sizeScale: Float = 1
 }
 
 /// Small deterministic RNG for seeding the initial particle field
@@ -122,9 +123,10 @@ enum SnowMath {
 final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
     // Controls bound by the SwiftUI overlay. This object is the
     // single source of truth for them; the frame loop reads them.
-    @Published var flakeCount: Double = 30_000
+    @Published var flakeCount: Double = 100_000
     @Published var wind: Double = 1.5
     @Published var fallSpeed: Double = 1.0
+    @Published var flakeSize: Double = 1.0
     @Published var walkMode: Bool = false
 
     // Live stats shown in the overlay, refreshed twice a second.
@@ -159,6 +161,13 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
 
     private var particleBuffer: MTLBuffer?
     private var particleCount = 0
+    // Count-change debounce: at v1.2 counts (up to 1M) a rebuild
+    // is a real allocation + seed, so while the Flakes slider is
+    // being dragged the rebuild waits until the requested count
+    // holds still briefly instead of thrashing one rebuild per
+    // step. The blanket is never touched either way.
+    private var pendingCount = 0
+    private var pendingSince: CFTimeInterval = 0
 
     // Falling volume: +/- 14 m in x/z, respawn at 13 m, floor y = 0.
     private let volumeHalfExtent: Float = 14
@@ -170,7 +179,9 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
     // each frame the heightfield pass reads one and writes the
     // other, then the particle pass and the vertex shader read the
     // freshly written one. Must match GRID_N in Shaders.metal.
-    static let heightfieldGrid = 128
+    // 256x256 in v1.2 (was 128): ~0.11 m cells, so accumulation
+    // relief survives at hand scale and stacks can form.
+    static let heightfieldGrid = 256
     private let blanketCap: Float = 0.8
     private let pressDepth: Float = 0.16
     private var heightBuffers: [MTLBuffer] = []
@@ -252,8 +263,11 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
         for b in heightBuffers {
             memset(b.contents(), 0, b.length)
         }
-        // Coarse 32x32 random grid, bilinearly upsampled to n x n.
-        let coarse = 32
+        // Coarse 64x64 random grid, bilinearly upsampled to n x n.
+        // (32x32 in v1.1; at the finer v1.2 grid the growth noise
+        // gets a finer feature scale too, ~0.44 m, so fresh snow
+        // rises in soft mounds rather than one flat sheet.)
+        let coarse = 64
         var rng = SplitMix64(state: 0x4E4F_4953_4500_0001)
         var grid = [Float](repeating: 0, count: coarse * coarse)
         for i in 0..<(coarse * coarse) { grid[i] = rng.nextFloat() }
@@ -286,9 +300,12 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
 
     /// Blanket growth rate in m/s for the current flake count:
     /// a visible coating inside a minute, a real layer over
-    /// several minutes at the 30k default.
+    /// several minutes at the default count. The reference count
+    /// is the v1.2 default (100k): v1.1 paced 0.0016 m/s at its
+    /// 30k default, and the rate is rescaled so the pacing at
+    /// the default is unchanged even though the default moved.
     private func growthRate(count: Int) -> Float {
-        0.0016 * Float(count) / 30_000
+        0.0016 * Float(count) / 100_000
     }
 
     /// Restart the accumulation from bare ground: zero the blanket,
@@ -300,6 +317,7 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
         }
         avgBlanket = 0
         rebuildParticles(count: Int(flakeCount.rounded()))
+        pendingCount = particleCount
     }
 
     /// Walk-mode drag: horizontal movement turns the body,
@@ -316,9 +334,10 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
     }
 
     /// (Re)build the particle buffer with fresh random flakes. Runs
-    /// only when the requested count changes and on Clear — never
-    /// per frame. The blanket is untouched, so changing the count
-    /// mid-run does not disturb the accumulation.
+    /// only when the requested count changes (debounced, see
+    /// draw(in:)) and on Clear — never per frame. The blanket is
+    /// untouched, so changing the count mid-run does not disturb
+    /// the accumulation.
     private func rebuildParticles(count: Int) {
         particleCount = count
         guard count > 0 else {
@@ -331,26 +350,33 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
             particleBuffer = nil
             return
         }
+        // Seed through a typed float pointer: at the v1.2 ceiling
+        // (1M flakes) the per-field storeBytes loop of v1.1 would
+        // stall the frame loop for seconds. Field order matches
+        // SnowParticleLayout byte offsets / 4. The buffer is not
+        // yet submitted to the GPU, so binding it here is safe.
+        let floatsPerFlake = stride / MemoryLayout<Float>.stride
+        let floats = buffer.contents().bindMemory(to: Float.self,
+                                                  capacity: count * floatsPerFlake)
         var rng = SplitMix64(state: 0x5EED_0000_0000_0001)
-        let base = buffer.contents()
         for i in 0..<count {
-            let p = base.advanced(by: i * stride)
-            let x = (rng.nextFloat() * 2 - 1) * volumeHalfExtent
-            let y = rng.nextFloat() * volumeHeight
-            let z = (rng.nextFloat() * 2 - 1) * volumeHalfExtent
+            let o = i * floatsPerFlake
             let fall = 0.6 + rng.nextFloat() * 1.0        // 0.6...1.6 m/s
-            let diameter = 0.02 + rng.nextFloat() * 0.045 // 2...6.5 cm
-            p.storeBytes(of: x, toByteOffset: SnowParticleLayout.positionX, as: Float.self)
-            p.storeBytes(of: y, toByteOffset: SnowParticleLayout.positionY, as: Float.self)
-            p.storeBytes(of: z, toByteOffset: SnowParticleLayout.positionZ, as: Float.self)
-            p.storeBytes(of: Float(0), toByteOffset: SnowParticleLayout.velocityX, as: Float.self)
-            // Velocity is the flake's actual signed velocity in
-            // v1.1: it starts out falling at its terminal speed.
-            p.storeBytes(of: -fall, toByteOffset: SnowParticleLayout.velocityY, as: Float.self)
-            p.storeBytes(of: Float(0), toByteOffset: SnowParticleLayout.velocityZ, as: Float.self)
-            p.storeBytes(of: rng.nextFloat() * 100, toByteOffset: SnowParticleLayout.randomOffset, as: Float.self)
-            p.storeBytes(of: diameter, toByteOffset: SnowParticleLayout.size, as: Float.self)
-            p.storeBytes(of: Float(0), toByteOffset: SnowParticleLayout.state, as: Float.self)
+            // v1.2: flakes are roughly half v1.1's size so the
+            // snow reads fine-grained — 1.0...3.6 cm diameter
+            // (was 2...6.5 cm).
+            let diameter = 0.010 + rng.nextFloat() * 0.026
+            floats[o + 0] = (rng.nextFloat() * 2 - 1) * volumeHalfExtent
+            floats[o + 1] = rng.nextFloat() * volumeHeight
+            floats[o + 2] = (rng.nextFloat() * 2 - 1) * volumeHalfExtent
+            floats[o + 3] = 0
+            // Velocity is the flake's actual signed velocity: it
+            // starts out falling at its terminal speed.
+            floats[o + 4] = -fall
+            floats[o + 5] = 0
+            floats[o + 6] = rng.nextFloat() * 100
+            floats[o + 7] = diameter
+            floats[o + 8] = 0
         }
         particleBuffer = buffer
     }
@@ -370,7 +396,16 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
 
         let wanted = Int(flakeCount.rounded())
         if wanted != particleCount {
-            rebuildParticles(count: wanted)
+            if particleCount == 0 {
+                rebuildParticles(count: wanted) // first build: no wait
+                pendingCount = particleCount
+            } else if wanted != pendingCount {
+                pendingCount = wanted
+                pendingSince = now
+            } else if now - pendingSince > 0.15 {
+                rebuildParticles(count: wanted)
+                pendingCount = particleCount
+            }
         }
         guard particleCount > 0,
               let buffer = particleBuffer,
@@ -491,6 +526,7 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
         // Pixels per world unit at unit depth: drawableHeight/2 * proj[1][1].
         frame.pointScale = Float(drawableSize.height) * 0.5 / tan(fovY * 0.5)
         frame.halfExtent = volumeHalfExtent
+        frame.sizeScale = Float(flakeSize)
 
         // --- Pass 3 (render): ground, then every flake in ONE
         // point draw call reading the same buffers the compute

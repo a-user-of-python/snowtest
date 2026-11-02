@@ -1,7 +1,8 @@
 // ContentView.swift — SnowTest UI: the Metal view full-screen,
 // a live stats panel top-left, and the control panel along the
-// bottom (three sliders, an Orbit/Walk mode picker, and a Clear
-// snow button). Kept deliberately minimal: this app exists to
+// bottom (flake count on a log scale, wind, fall speed and flake
+// size sliders, an Orbit/Walk mode picker, and a Clear snow
+// button). Kept deliberately minimal: this app exists to
 // judge the snowfall and its frame rate at a glance. High
 // contrast, uncluttered.
 
@@ -50,11 +51,7 @@ struct ContentView: View {
 
     private var controlsPanel: some View {
         VStack(spacing: 10) {
-            sliderRow(title: "Flakes",
-                      value: snow.liveCount.formatted(.number),
-                      binding: $snow.flakeCount,
-                      range: 1_000...100_000,
-                      step: 1_000)
+            flakesRow
             sliderRow(title: "Wind",
                       value: String(format: "%.1f m/s", snow.wind),
                       binding: $snow.wind,
@@ -65,6 +62,11 @@ struct ContentView: View {
                       binding: $snow.fallSpeed,
                       range: 0.2...2.5,
                       step: 0.05)
+            sliderRow(title: "Flake size",
+                      value: String(format: "%.1fx", snow.flakeSize),
+                      binding: $snow.flakeSize,
+                      range: 0.5...2.5,
+                      step: 0.1)
             HStack(spacing: 12) {
                 Picker("View", selection: $snow.walkMode) {
                     Text("Orbit").tag(false)
@@ -89,6 +91,37 @@ struct ContentView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    /// The Flakes slider runs on a log10 scale (1k ... 1M): fine
+    /// control at the low end, coarse jumps at the high end,
+    /// with the count snapped to magnitude-appropriate steps so
+    /// the label stays a round number.
+    private var flakesRow: some View {
+        HStack(spacing: 12) {
+            Text("Flakes")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 86, alignment: .leading)
+            Slider(value: flakeCountLogBinding, in: 3.0...6.0)
+                .tint(.white)
+            Text(snow.flakeCount.formatted(.number))
+                .font(.system(size: 15, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.9))
+                .frame(width: 92, alignment: .trailing)
+        }
+    }
+
+    private var flakeCountLogBinding: Binding<Double> {
+        Binding(
+            get: { log10(max(snow.flakeCount, 1_000)) },
+            set: { newLog in
+                let raw = pow(10.0, newLog)
+                let step: Double = raw < 20_000 ? 250 : (raw < 200_000 ? 2_500 : 10_000)
+                let snapped = (raw / step).rounded() * step
+                snow.flakeCount = min(max(snapped, 1_000), 1_000_000)
+            }
+        )
     }
 
     private func sliderRow(title: String,

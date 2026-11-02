@@ -23,12 +23,19 @@ flakes plus a coarse heightfield for the blanket:
   landing height**, so the blanket fills with particles in layers
   through its whole thickness. Settled flakes recycle to the sky
   after a while (or when buried deep), so the snowfall never dies.
-- A second compute pass advances a 128×128 **heightfield** — the
+- A second compute pass advances a 256×256 **heightfield** — the
   blanket itself: it grows with the snowfall (rate follows the
   flake count), compacts under its own weight, relaxes slopes
   toward a ~33° angle of repose, creeps downwind and scours in
   strong wind, refills depressions over minutes (trails heal),
-  and is pressed down where the walk-mode body stands.
+  and is pressed down where the walk-mode body stands. At
+  ~0.11 m per cell the relief is fine enough for accumulation
+  to pile into visible stacks and mounds: a settling flake
+  rests on the local surface **plus a per-flake stacking
+  offset** (most within millimetres, a few proud by up to
+  ~4 cm), so busy landing spots grow knobbly piles on top of
+  the settled snow instead of a smooth sheet, while the field
+  underneath stays repose-limited and the stacks stay soft.
 - Ground physics for settled flakes lives in the flake kernel:
   compaction sink, surface-only wind scour (flakes buried more
   than ~5 cm are locked), support loss (a flake whose ground is
@@ -52,9 +59,11 @@ flakes plus a coarse heightfield for the blanket:
   (up/down to move, left/right to turn). Walking presses the
   blanket down, pushes settled flakes aside, kicks some into the
   air, and carves a trail that slowly heals over minutes.
-- Sliders for flake count (1,000–100,000), wind strength, and
-  fall speed. Defaults: 30,000 flakes, light wind. A **Clear
-  snow** button restarts the accumulation from bare ground.
+- Sliders for flake count (1,000–1,000,000 on a log scale),
+  wind strength, fall speed, and flake size. Flakes are small
+  by design (~1–3.6 cm) so the snow reads fine-grained.
+  Defaults: 100,000 flakes, light wind. A **Clear snow**
+  button restarts the accumulation from bare ground.
 - A live readout of FPS, flake count, and GPU frame time, always
   visible — the numbers this app exists to produce.
 

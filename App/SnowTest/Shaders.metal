@@ -1,9 +1,11 @@
 // Shaders.metal — SnowTest
 //
 // GPU snow, following the compute-particle design this test app
-// exists to prove out, extended in v1.1 with a living blanket:
+// exists to prove out, extended in v1.1 with a living blanket,
+// and in v1.2 with finer snow, far more of it, and real
+// stacking:
 //
-//   1. `updateHeightfield` (compute) advances a coarse 128x128
+//   1. `updateHeightfield` (compute) advances a 256x256
 //      heightfield over the falling volume — the blanket. Per
 //      frame it grows with the snowfall, compacts under its own
 //      weight, relaxes slopes toward a ~33 degree angle of
@@ -17,10 +19,13 @@
 //      shared MTLBuffer. Falling flakes integrate a real velocity
 //      (gravity up to their terminal speed, wind drift, body push).
 //      A flake that reaches the blanket surface SETTLES: it locks
-//      at its landing height, so the blanket fills with particles
-//      in layers through its whole thickness. Settled flakes sink
-//      slowly with compaction, drop if their support is carved
-//      away, can be scoured back into the air by strong wind if
+//      at its landing height — the local surface plus a per-flake
+//      stacking offset, so it rests on the micro-relief of the
+//      flakes already down and busy landing spots grow knobbly
+//      stacks instead of a smooth sheet. The blanket fills with
+//      particles in layers through its whole thickness. Settled
+//      flakes sink slowly with compaction, drop if their support
+//      is carved away, can be scoured back into the air by strong
 //      they lie at the surface, are displaced by the walk body
 //      (slid aside or kicked airborne), and eventually recycle to
 //      the sky so the snowfall never dies.
@@ -51,7 +56,9 @@
 using namespace metal;
 
 // Heightfield resolution (must match SnowRenderer.heightfieldGrid).
-#define GRID_N 128
+// 256x256 over +/-14 m: ~0.11 m cells, fine enough that local
+// relief — stacks, rims, trail walls — survives at hand scale.
+#define GRID_N 256
 
 struct SnowParticle {
     packed_float3 position;
@@ -98,6 +105,7 @@ struct FrameUniforms {
     float4x4 viewProjection;
     float pointScale;   // pixels per world unit at clip.w = 1
     float halfExtent;   // for heightfield sampling in the vertex shader
+    float sizeScale;    // user flake-size multiplier (1 = as seeded)
 };
 
 // Cheap deterministic hash -> [0, 1). Used so a recycled flake gets a
@@ -242,7 +250,18 @@ kernel void updateSnow(device SnowParticle *particles [[buffer(0)]],
 
     // Stable per-flake values derived from its random offset.
     float baseFall = 0.6 + fract(ro * 1.61803) * 1.0;   // terminal speed at 1x, m/s
-    float restOffset = (hash1(ro * 3.71) - 0.5) * 0.03; // +/-1.5 cm resting jitter
+    // Stacking rest height: a settling flake comes to rest ON the
+    // micro-relief of the flakes already down, not on the smooth
+    // field itself, so its rest height is the local surface plus
+    // this per-flake offset. The distribution is one-sided and
+    // bottom-heavy (stackH^2): most flakes sit within millimetres
+    // of the surface, a few ride proud by up to ~4 cm — the
+    // granular profile of the top of a real pile. The field
+    // underneath stays repose-limited, so busy landing spots
+    // (rims, drift crests, resettle clusters) read as soft
+    // knobbly stacks at hand scale, never needles.
+    float stackH = hash1(ro * 3.71);
+    float restOffset = -0.006 + stackH * stackH * 0.048; // -6 mm .. +4.2 cm
     float dwellLimit = 30.0 + fract(ro * 0.9173) * 40.0; // settled lifetime, 30..70 s
     bool kickable = fract(ro * 0.613) < 0.30;           // 30% of flakes kick when displaced
 
@@ -415,7 +434,7 @@ vertex FlakeOut snowVertex(const device SnowParticle *particles [[buffer(0)]],
     // vanish below one pixel.
     float depth = max(clip.w, 0.1);
     float sizeScale = settled ? 1.5 : 1.0;
-    out.pointSize = clamp(p.size * sizeScale * f.pointScale / depth, 1.0, 64.0);
+    out.pointSize = clamp(p.size * sizeScale * f.sizeScale * f.pointScale / depth, 1.0, 64.0);
     // Slight per-flake brightness variation so the field does not
     // read as one flat texture; settled snow a touch brighter.
     out.shade = 0.78 + 0.22 * fract(p.randomOffset * 7.31);
