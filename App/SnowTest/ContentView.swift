@@ -176,10 +176,11 @@ struct ContentView: View {
     }
 }
 
-/// The Metal view, configured once: no depth buffer (nothing needs
-/// one — the ground is drawn first and flakes blend over it), dark
-/// clear colour matching the ground shader's fade, up to 120 Hz
-/// where the panel supports it.
+/// The Metal view, configured once: a depth buffer (since v1.4
+/// the blanket is real displaced geometry that occludes the
+/// flakes inside and behind it, and the flakes depth-test
+/// against it), dark clear colour matching the ground shader's
+/// fade, up to 120 Hz where the panel supports it.
 struct SnowView: UIViewRepresentable {
     let renderer: SnowRenderer
 
@@ -189,7 +190,8 @@ struct SnowView: UIViewRepresentable {
         view.delegate = renderer
         view.preferredFramesPerSecond = 120
         view.colorPixelFormat = .bgra8Unorm
-        view.depthStencilPixelFormat = .invalid
+        view.depthStencilPixelFormat = .depth32Float
+        view.clearDepth = 1.0
         view.clearColor = MTLClearColor(red: 0.015, green: 0.025, blue: 0.05, alpha: 1)
         view.isPaused = false
         view.enableSetNeedsDisplay = false

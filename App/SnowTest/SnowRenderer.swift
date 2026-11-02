@@ -6,9 +6,12 @@
 // buffers holds the blanket heightfield (ping-ponged), advanced by
 // its own compute pass: growth, compaction, slope relaxation,
 // wind drift, depression refill, and the walk body's footprint
-// press. The CPU only fills buffers (at start, on count change,
-// and on Clear), passes small uniforms, and issues the passes.
-// Particle and heightfield data are never copied back.
+// press. Since v1.4 a three-pass GPU culling stage compacts the
+// visible flakes into an indirect draw, and the blanket renders
+// as a heightfield-displaced mesh with depth testing. The CPU
+// only fills buffers (at start, on count change, and on Clear),
+// passes small uniforms, and issues the passes. Particle and
+// heightfield data are never copied back.
 
 import Metal
 import MetalKit
@@ -71,6 +74,16 @@ struct FrameUniforms {
     var pointScale: Float = 1
     var halfExtent: Float = 14
     var sizeScale: Float = 1
+}
+
+/// Mirror of `CullUniforms` in Shaders.metal (v1.4) — matrix plus
+/// plain scalars, identical layout on both sides (80 bytes).
+struct CullUniforms {
+    var viewProjection = matrix_identity_float4x4
+    var halfExtent: Float = 14
+    var sizeScale: Float = 1
+    var flakeCount: UInt32 = 0
+    var groupCount: UInt32 = 0
 }
 
 /// Small deterministic RNG for seeding the initial particle field
@@ -156,11 +169,32 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
     private let queue: MTLCommandQueue
     private let computePipeline: MTLComputePipelineState
     private let heightfieldPipeline: MTLComputePipelineState
+    private let cullCountPipeline: MTLComputePipelineState
+    private let cullScanPipeline: MTLComputePipelineState
+    private let cullWritePipeline: MTLComputePipelineState
     private let snowPipeline: MTLRenderPipelineState
-    private let groundPipeline: MTLRenderPipelineState
+    private let surfacePipeline: MTLRenderPipelineState
+    private let apronPipeline: MTLRenderPipelineState
+    // Surface and apron are opaque and write depth; flakes test
+    // against it (so the blanket's geometry occludes the flakes
+    // inside and behind it) but never write.
+    private let depthWriteState: MTLDepthStencilState
+    private let depthTestState: MTLDepthStencilState
 
     private var particleBuffer: MTLBuffer?
     private var particleCount = 0
+    // Visibility-culling state (v1.4), sized to match the live
+    // particle buffer and rebuilt with it in rebuildParticles:
+    // the visible-index draw list, the per-flake rank scratch,
+    // per-threadgroup visible totals and their prefix offsets,
+    // and the indirect-draw arguments the scan pass fills in.
+    // The CPU never reads any of it back.
+    private var visibleIndexBuffer: MTLBuffer?
+    private var rankScratchBuffer: MTLBuffer?
+    private var groupTotalsBuffer: MTLBuffer?
+    private var groupOffsetsBuffer: MTLBuffer?
+    private var cullArgsBuffer: MTLBuffer?
+    private var cullGroupCount = 0
     // Count-change debounce: at v1.2/v1.3 counts (up to 5M) a
     // rebuild is a real allocation + seed, so while the Flakes
     // slider is being dragged the rebuild waits until the
@@ -229,11 +263,20 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
                 fatalError("Missing compute function updateHeightfield")
             }
             heightfieldPipeline = try device.makeComputePipelineState(function: hfFunction)
+            guard let cullCountFunction = library.makeFunction(name: "cullFlakesCount"),
+                  let cullScanFunction = library.makeFunction(name: "cullFlakesScan"),
+                  let cullWriteFunction = library.makeFunction(name: "cullFlakesWrite") else {
+                fatalError("Missing culling compute functions")
+            }
+            cullCountPipeline = try device.makeComputePipelineState(function: cullCountFunction)
+            cullScanPipeline = try device.makeComputePipelineState(function: cullScanFunction)
+            cullWritePipeline = try device.makeComputePipelineState(function: cullWriteFunction)
 
             let snowDescriptor = MTLRenderPipelineDescriptor()
             snowDescriptor.vertexFunction = library.makeFunction(name: "snowVertex")
             snowDescriptor.fragmentFunction = library.makeFunction(name: "snowFragment")
             snowDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            snowDescriptor.depthAttachmentPixelFormat = .depth32Float
             // Soft flakes blend over the ground and each other.
             if let snowAttachment = snowDescriptor.colorAttachments[0] {
                 snowAttachment.isBlendingEnabled = true
@@ -246,14 +289,41 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
             }
             snowPipeline = try device.makeRenderPipelineState(descriptor: snowDescriptor)
 
-            let groundDescriptor = MTLRenderPipelineDescriptor()
-            groundDescriptor.vertexFunction = library.makeFunction(name: "groundVertex")
-            groundDescriptor.fragmentFunction = library.makeFunction(name: "groundFragment")
-            groundDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-            groundPipeline = try device.makeRenderPipelineState(descriptor: groundDescriptor)
+            let surfaceDescriptor = MTLRenderPipelineDescriptor()
+            surfaceDescriptor.vertexFunction = library.makeFunction(name: "surfaceVertex")
+            surfaceDescriptor.fragmentFunction = library.makeFunction(name: "surfaceFragment")
+            surfaceDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            surfaceDescriptor.depthAttachmentPixelFormat = .depth32Float
+            surfacePipeline = try device.makeRenderPipelineState(descriptor: surfaceDescriptor)
+
+            let apronDescriptor = MTLRenderPipelineDescriptor()
+            apronDescriptor.vertexFunction = library.makeFunction(name: "apronVertex")
+            apronDescriptor.fragmentFunction = library.makeFunction(name: "apronFragment")
+            apronDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            apronDescriptor.depthAttachmentPixelFormat = .depth32Float
+            apronPipeline = try device.makeRenderPipelineState(descriptor: apronDescriptor)
+
+            let writeDescriptor = MTLDepthStencilDescriptor()
+            writeDescriptor.depthCompareFunction = .less
+            writeDescriptor.isDepthWriteEnabled = true
+            guard let writeState = device.makeDepthStencilState(descriptor: writeDescriptor) else {
+                fatalError("Could not create depth-write state")
+            }
+            depthWriteState = writeState
+            let testDescriptor = MTLDepthStencilDescriptor()
+            testDescriptor.depthCompareFunction = .less
+            testDescriptor.isDepthWriteEnabled = false
+            guard let testState = device.makeDepthStencilState(descriptor: testDescriptor) else {
+                fatalError("Could not create depth-test state")
+            }
+            depthTestState = testState
         } catch {
             fatalError("Metal pipeline setup failed: \(error)")
         }
+        // Indirect-draw arguments for the culled flake draw: 16
+        // bytes matching MTLDrawPrimitivesIndirectArguments,
+        // written each frame by cullFlakesScan on the GPU.
+        cullArgsBuffer = device.makeBuffer(length: 16, options: .storageModeShared)
         super.init()
         buildHeightfield()
     }
@@ -394,6 +464,31 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
             floats[o + 7] = diameter
             floats[o + 8] = 0
         }
+        // The v1.4 culling buffers are sized to this flake count
+        // and must exist for the draw, so they are allocated as
+        // part of the same rebuild: if any of them fails, the
+        // whole rebuild counts as failed and the previous buffer
+        // set stays live (same rule as the particle allocation
+        // above). At the 5M ceiling they add ~40 MB over the
+        // ~180 MB particle buffer (two 20 MB uint arrays plus
+        // small per-group arrays).
+        let groups = (count + 255) / 256
+        guard let indices = device.makeBuffer(length: count * 4,
+                                              options: .storageModeShared),
+              let scratch = device.makeBuffer(length: count * 4,
+                                              options: .storageModeShared),
+              let totals = device.makeBuffer(length: groups * 4,
+                                             options: .storageModeShared),
+              let offsets = device.makeBuffer(length: groups * 4,
+                                              options: .storageModeShared) else {
+            failedCount = count
+            return
+        }
+        visibleIndexBuffer = indices
+        rankScratchBuffer = scratch
+        groupTotalsBuffer = totals
+        groupOffsetsBuffer = offsets
+        cullGroupCount = groups
         particleCount = count
         particleBuffer = buffer
         failedCount = 0
@@ -468,6 +563,42 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
         avgBlanket = Float(min(max(Double(avgBlanket) + blanketDelta * rawDt, 0),
                                Double(blanketCap)))
 
+        // --- Camera + frame uniforms, computed first: the
+        // culling passes below need the same view-projection
+        // matrix the render passes will use. ---
+        let drawableSize = view.drawableSize
+        let aspect = Float(drawableSize.width / max(drawableSize.height, 1))
+        let projection = SnowMath.perspective(fovY: fovY, aspect: aspect, near: 0.1, far: 200)
+        let viewMatrix: simd_float4x4
+        if walkMode {
+            // Eye just above the blanket at the body's position,
+            // looking along its facing, pitched very slightly down.
+            let eye = SIMD3<Float>(bodyX, avgBlanket + 1.5, bodyZ)
+            let forward = SIMD3<Float>(-sin(bodyYaw), -0.055, -cos(bodyYaw))
+            viewMatrix = SnowMath.lookAt(eye: eye, target: eye + forward,
+                                         up: SIMD3<Float>(0, 1, 0))
+        } else {
+            let eye = cameraTarget + SIMD3<Float>(
+                cos(cameraPitch) * sin(cameraYaw),
+                sin(cameraPitch),
+                cos(cameraPitch) * cos(cameraYaw)) * cameraDistance
+            viewMatrix = SnowMath.lookAt(eye: eye, target: cameraTarget,
+                                         up: SIMD3<Float>(0, 1, 0))
+        }
+        var frame = FrameUniforms()
+        frame.viewProjection = projection * viewMatrix
+        // Pixels per world unit at unit depth: drawableHeight/2 * proj[1][1].
+        frame.pointScale = Float(drawableSize.height) * 0.5 / tan(fovY * 0.5)
+        frame.halfExtent = volumeHalfExtent
+        frame.sizeScale = Float(flakeSize)
+
+        var cull = CullUniforms()
+        cull.viewProjection = frame.viewProjection
+        cull.halfExtent = volumeHalfExtent
+        cull.sizeScale = Float(flakeSize)
+        cull.flakeCount = UInt32(particleCount)
+        cull.groupCount = UInt32(cullGroupCount)
+
         let hfSrc = heightBuffers[hfReadIndex]
         let hfDst = heightBuffers[1 - hfReadIndex]
 
@@ -519,52 +650,78 @@ final class SnowRenderer: NSObject, ObservableObject, MTKViewDelegate {
             compute.endEncoding()
         }
 
-        // --- Camera + frame uniforms for the render passes. ---
-        let drawableSize = view.drawableSize
-        let aspect = Float(drawableSize.width / max(drawableSize.height, 1))
-        let projection = SnowMath.perspective(fovY: fovY, aspect: aspect, near: 0.1, far: 200)
-        let viewMatrix: simd_float4x4
-        if walkMode {
-            // Eye just above the blanket at the body's position,
-            // looking along its facing, pitched very slightly down.
-            let eye = SIMD3<Float>(bodyX, avgBlanket + 1.5, bodyZ)
-            let forward = SIMD3<Float>(-sin(bodyYaw), -0.055, -cos(bodyYaw))
-            viewMatrix = SnowMath.lookAt(eye: eye, target: eye + forward,
-                                         up: SIMD3<Float>(0, 1, 0))
-        } else {
-            let eye = cameraTarget + SIMD3<Float>(
-                cos(cameraPitch) * sin(cameraYaw),
-                sin(cameraPitch),
-                cos(cameraPitch) * cos(cameraYaw)) * cameraDistance
-            viewMatrix = SnowMath.lookAt(eye: eye, target: cameraTarget,
-                                         up: SIMD3<Float>(0, 1, 0))
-        }
-        var frame = FrameUniforms()
-        frame.viewProjection = projection * viewMatrix
-        // Pixels per world unit at unit depth: drawableHeight/2 * proj[1][1].
-        frame.pointScale = Float(drawableSize.height) * 0.5 / tan(fovY * 0.5)
-        frame.halfExtent = volumeHalfExtent
-        frame.sizeScale = Float(flakeSize)
+        // --- Pass 3 (compute, v1.4): visibility culling. Three
+        // small dispatches compact the flakes that can actually
+        // be seen (not buried past the fade range, inside the
+        // frustum) into the visible-index list and write the
+        // survivor count into the indirect-draw arguments. The
+        // culling buffers always exist alongside the particle
+        // buffer (allocated together in rebuildParticles). ---
+        if let indices = visibleIndexBuffer,
+           let scratch = rankScratchBuffer,
+           let totals = groupTotalsBuffer,
+           let offsets = groupOffsetsBuffer,
+           let args = cullArgsBuffer {
+            let groupSize = MTLSize(width: 256, height: 1, depth: 1)
+            let groupGrid = MTLSize(width: cullGroupCount, height: 1, depth: 1)
+            if let countEnc = commandBuffer.makeComputeCommandEncoder() {
+                countEnc.setComputePipelineState(cullCountPipeline)
+                countEnc.setBuffer(buffer, offset: 0, index: 0)
+                countEnc.setBuffer(hfDst, offset: 0, index: 1)
+                countEnc.setBytes(&cull, length: MemoryLayout<CullUniforms>.stride, index: 2)
+                countEnc.setBuffer(scratch, offset: 0, index: 3)
+                countEnc.setBuffer(totals, offset: 0, index: 4)
+                countEnc.dispatchThreadgroups(groupGrid, threadsPerThreadgroup: groupSize)
+                countEnc.endEncoding()
+            }
+            if let scanEnc = commandBuffer.makeComputeCommandEncoder() {
+                scanEnc.setComputePipelineState(cullScanPipeline)
+                scanEnc.setBuffer(totals, offset: 0, index: 0)
+                scanEnc.setBuffer(offsets, offset: 0, index: 1)
+                scanEnc.setBuffer(args, offset: 0, index: 2)
+                scanEnc.setBytes(&cull, length: MemoryLayout<CullUniforms>.stride, index: 3)
+                scanEnc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                scanEnc.endEncoding()
+            }
+            if let writeEnc = commandBuffer.makeComputeCommandEncoder() {
+                writeEnc.setComputePipelineState(cullWritePipeline)
+                writeEnc.setBuffer(scratch, offset: 0, index: 0)
+                writeEnc.setBuffer(offsets, offset: 0, index: 1)
+                writeEnc.setBuffer(indices, offset: 0, index: 2)
+                writeEnc.setBytes(&cull, length: MemoryLayout<CullUniforms>.stride, index: 3)
+                writeEnc.dispatchThreadgroups(groupGrid, threadsPerThreadgroup: groupSize)
+                writeEnc.endEncoding()
+            }
 
-        // --- Pass 3 (render): ground, then every flake in ONE
-        // point draw call reading the same buffers the compute
-        // passes just updated. ---
-        if let render = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) {
-            render.setRenderPipelineState(groundPipeline)
-            render.setVertexBytes(&frame, length: MemoryLayout<FrameUniforms>.stride, index: 1)
-            // The ground fragment shader samples the fresh
-            // heightfield to lay its snow-base tint (v1.3) — the
-            // same buffer the snow vertex shader reads below.
-            render.setFragmentBuffer(hfDst, offset: 0, index: 0)
-            render.setFragmentBytes(&frame, length: MemoryLayout<FrameUniforms>.stride, index: 1)
-            render.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+            // --- Pass 4 (render): the blanket surface and the
+            // floor apron (opaque, depth-writing), then every
+            // visible flake in ONE indirect point draw call
+            // (depth-tested against the surface, never writing). ---
+            if let render = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) {
+                let surfaceVertexCount = (SnowRenderer.heightfieldGrid - 1)
+                                       * (SnowRenderer.heightfieldGrid - 1) * 6
+                render.setDepthStencilState(depthWriteState)
+                render.setRenderPipelineState(surfacePipeline)
+                render.setVertexBuffer(hfDst, offset: 0, index: 0)
+                render.setVertexBytes(&frame, length: MemoryLayout<FrameUniforms>.stride, index: 1)
+                render.drawPrimitives(type: .triangle, vertexStart: 0,
+                                      vertexCount: surfaceVertexCount)
 
-            render.setRenderPipelineState(snowPipeline)
-            render.setVertexBuffer(buffer, offset: 0, index: 0)
-            render.setVertexBytes(&frame, length: MemoryLayout<FrameUniforms>.stride, index: 1)
-            render.setVertexBuffer(hfDst, offset: 0, index: 2)
-            render.drawPrimitives(type: .point, vertexStart: 0, vertexCount: particleCount)
-            render.endEncoding()
+                render.setRenderPipelineState(apronPipeline)
+                render.setVertexBytes(&frame, length: MemoryLayout<FrameUniforms>.stride, index: 1)
+                render.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 24)
+
+                render.setDepthStencilState(depthTestState)
+                render.setRenderPipelineState(snowPipeline)
+                render.setVertexBuffer(buffer, offset: 0, index: 0)
+                render.setVertexBytes(&frame, length: MemoryLayout<FrameUniforms>.stride, index: 1)
+                render.setVertexBuffer(hfDst, offset: 0, index: 2)
+                render.setVertexBuffer(indices, offset: 0, index: 3)
+                render.drawPrimitives(type: .point, indirectBuffer: args,
+                                      indirectBufferOffset: 0)
+                render.endEncoding()
+            }
         }
 
         commandBuffer.present(drawable)
